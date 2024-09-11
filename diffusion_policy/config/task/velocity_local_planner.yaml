@@ -1,0 +1,27 @@
+name: velocity_local_planner
+
+image_shape: &image_shape [3, 480, 640]
+shape_meta: &shape_meta
+  # acceptable types: rgb, low_dim
+  obs:
+    image:
+      shape: *image_shape
+      type: rgb
+    state:
+      shape: [3] # linear x, linear y, angular z
+      type: low_dim
+    goal:
+      shape: [3] # goal x, goal y, goal z
+      type: low_dim
+  action:
+    shape: [3] # command velocity (linear x, linear y, angular z)
+
+dataset:
+  _target_: diffusion_policy.dataset.velocity_local_planner_dataset.VelocityLocalPlannerDataset
+  zarr_path: data/velocity_local_planner/sim_data_v1.zarr
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: 42
+  val_ratio: 0.02
+  max_train_episodes: 90

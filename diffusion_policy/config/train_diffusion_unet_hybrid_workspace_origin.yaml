@@ -1,6 +1,6 @@
 defaults:
   - _self_
-  - task: velocity_local_planner
+  - task: lift_image_abs
 
 name: train_diffusion_unet_hybrid
 _target_: diffusion_policy.workspace.train_diffusion_unet_hybrid_workspace.TrainDiffusionUnetHybridWorkspace
@@ -9,10 +9,10 @@ task_name: ${task.name}
 shape_meta: ${task.shape_meta}
 exp_name: "default"
 
-horizon: 8 # Prediction Horizon (T)
-n_obs_steps: 4  # Observation Horizon (To)
-n_action_steps: 2 # Action Horizon (Ta)
-n_latency_steps: 0  # Latency Horizon (Tl)
+horizon: 16
+n_obs_steps: 2
+n_action_steps: 8
+n_latency_steps: 0
 dataset_obs_steps: ${n_obs_steps}
 past_action_visible: False
 keypoint_visible_rate: 1.0
@@ -38,7 +38,7 @@ policy:
   n_obs_steps: ${n_obs_steps}
   num_inference_steps: 100
   obs_as_global_cond: ${obs_as_global_cond}
-  crop_shape: [432, 576]
+  crop_shape: [76, 76]
   # crop_shape: null
   diffusion_step_embed_dim: 128
   down_dims: [512, 1024, 2048]
@@ -60,14 +60,14 @@ ema:
   max_value: 0.9999
 
 dataloader:
-  batch_size: 16
+  batch_size: 64
   num_workers: 8
   shuffle: True
   pin_memory: True
   persistent_workers: False
 
 val_dataloader:
-  batch_size: 16
+  batch_size: 64
   num_workers: 8
   shuffle: False
   pin_memory: True
@@ -88,7 +88,7 @@ training:
   # optimization
   lr_scheduler: cosine
   lr_warmup_steps: 500
-  num_epochs: 1050  # too many
+  num_epochs: 3050
   gradient_accumulate_every: 1
   # EMA destroys performance when used with BatchNorm
   # replace BatchNorm with GroupNorm.
@@ -116,10 +116,10 @@ logging:
 
 checkpoint:
   topk:
-    monitor_key: train_loss
-    mode: min
+    monitor_key: test_mean_score
+    mode: max
     k: 5
-    format_str: 'epoch={epoch:04d}-train_loss={train_loss:.3f}.ckpt'
+    format_str: 'epoch={epoch:04d}-test_mean_score={test_mean_score:.3f}.ckpt'
   save_last_ckpt: True
   save_last_snapshot: False
 
