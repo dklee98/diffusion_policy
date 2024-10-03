@@ -26,6 +26,7 @@ import sys
 import dill
 import hydra
 import time
+import threading
 from math import pi as M_PI
 from diffusion_policy.workspace.base_workspace import BaseWorkspace
 from diffusion_policy.policy.base_image_policy import BaseImagePolicy
@@ -45,6 +46,7 @@ def find_nearest_waypoint(waypoints, position):
 class InferenceNode:
     def __init__(self, model_path):
         self.debug = True
+        self.lock = threading.Lock()
         # Initialize the ROS node
         rospy.init_node('inference_node', anonymous=True)
         
@@ -60,7 +62,7 @@ class InferenceNode:
         self.state_obs = None
 
         # Subscribers for sync
-        self.img_sub = Subscriber('/camera/left/rgb_img', Image)
+        self.img_sub = Subscriber('/go1_gazebo/camera/color/image_raw', Image)
         self.odom_sub = Subscriber('/ground_truth_pose', Odometry)
 
         # ApproximateTimeSynchronizer
@@ -98,75 +100,79 @@ class InferenceNode:
         return policy
     
     def sync_callback(self, img_msg, odom_msg):
-        # print('asdfasd')
-        synced_time = img_msg.header.stamp.to_sec()
-        ## Img
-        try:
-            # Convert the ROS Image message to OpenCV2
-            cv_image = self.bridge.imgmsg_to_cv2(img_msg, "bgr8")
-            # Convert to the required format
-            cv_image = cv2.resize(cv_image, (640, 480)).astype(np.float32) / 255.0    # (H, W, C)
-            cv_image = np.moveaxis(cv_image, -1, 0)  # Move channel to first dimension (C, H, W)
-            # if self.debug: print(f"Image shape: {cv_image.shape}")
-        except CvBridgeError as e:
-            rospy.logerr(f"Failed to convert image: {e}")
+        with self.lock:
+            # print('asdfasd')
+            synced_time = img_msg.header.stamp.to_sec()
+            ## Img
+            try:
+                # Convert the ROS Image message to OpenCV2
+                cv_image = self.bridge.imgmsg_to_cv2(img_msg, "bgr8")
+                # Convert to the required format
+                cv_image = cv2.resize(cv_image, (640, 480)).astype(np.float32) / 255.0    # (H, W, C)
+                cv_image = np.moveaxis(cv_image, -1, 0)  # Move channel to first dimension (C, H, W)
+                # if self.debug: print(f"Image shape: {cv_image.shape}")
+            except CvBridgeError as e:
+                rospy.logerr(f"Failed to convert image: {e}")
 
-        ## Odom
-        # get R_t rotation matrix
-        curr_pose = np.array([odom_msg.pose.pose.position.x, odom_msg.pose.pose.position.y, odom_msg.pose.pose.position.z], dtype=np.float32)
-        curr_quat = np.array([odom_msg.pose.pose.orientation.x, odom_msg.pose.pose.orientation.y, odom_msg.pose.pose.orientation.z, odom_msg.pose.pose.orientation.w], dtype=np.float32)
-        curr_rot = tf.transformations.quaternion_matrix(curr_quat)[:3,:3]
-        curr_euler = tf.transformations.euler_from_quaternion(curr_quat)
-        curr_vel = np.array([odom_msg.twist.twist.linear.x, odom_msg.twist.twist.linear.y, odom_msg.twist.twist.angular.z], dtype=np.float32)
-        curr_vel = np.dot(curr_rot.T, curr_vel)
+            ## Odom
+            # get R_t rotation matrix
+            curr_pose = np.array([odom_msg.pose.pose.position.x, odom_msg.pose.pose.position.y, odom_msg.pose.pose.position.z], dtype=np.float32)
+            curr_quat = np.array([odom_msg.pose.pose.orientation.x, odom_msg.pose.pose.orientation.y, odom_msg.pose.pose.orientation.z, odom_msg.pose.pose.orientation.w], dtype=np.float32)
+            curr_rot = tf.transformations.quaternion_matrix(curr_quat)[:3,:3]
+            curr_euler = tf.transformations.euler_from_quaternion(curr_quat)
+            curr_vel = np.array([odom_msg.twist.twist.linear.x, odom_msg.twist.twist.linear.y, odom_msg.twist.twist.angular.z], dtype=np.float32)
+            curr_vel = np.dot(curr_rot.T, curr_vel)
 
-        self.img_odom_buffer.append({
-            'image': cv_image, # (C, H, W)
-            'pose': curr_pose, # (3,)
-            'euler': curr_euler, # (3,)
-            'velocity': curr_vel, # (3,)
-            'time': synced_time # (1,)
-        })
+            self.img_odom_buffer.append({
+                'image': cv_image, # (C, H, W)
+                'pose': curr_pose, # (3,)
+                'euler': curr_euler, # (3,)
+                'velocity': curr_vel, # (3,)
+                'time': synced_time # (1,)
+            })
 
-        # if self.debug: print(f"buffer length: {len(self.img_odom_buffer)}")
+            # if self.debug: print(f"buffer length: {len(self.img_odom_buffer)}")
 
     def goalpoint_callback(self, msg):
-        if self.img_odom_buffer is None:
-            print("Goal: Waiting for state and image data...")
-            return
-        self.goal = np.array([msg.pose.position.x, msg.pose.position.y, msg.pose.position.z], dtype=np.float32)
-        self.isGoal = True
+        with self.lock:
+            if self.img_odom_buffer is None:
+                print("Goal: Waiting for state and image data...")
+                return
+            self.goal = np.array([msg.pose.position.x, msg.pose.position.y, msg.pose.position.z], dtype=np.float32)
+            self.isGoal = True
 
     def get_obs(self) -> dict:
-        if len(self.img_odom_buffer) == 0:
-            return None
-        ## Make img dict (T, C, H, W)
-        img_dict = np.stack([item['image'] for item in self.img_odom_buffer], axis=0)
+        with self.lock:
+            if len(self.img_odom_buffer) == 0:
+                return None
+            ## Make img dict (T, C, H, W)
+            img_dict = np.stack([item['image'] for item in self.img_odom_buffer], axis=0)
 
-        ## Make state dict (T, 3)
-        state_dict = np.stack([item['velocity'] for item in self.img_odom_buffer], axis=0)
+            ## Make state dict (T, 3)
+            state_dict = np.stack([item['velocity'] for item in self.img_odom_buffer], axis=0)
 
-        ## cal relative goal
-        if self.isGoal:
-            goal_dict = np.stack([self.get_relative_goal(item['pose'], item['euler'], self.goal) for item in self.img_odom_buffer], axis=0)
-        else:
-            goal_dict = np.zeros((len(self.img_odom_buffer), 3), dtype=np.float32)
-                
-        ## Make timestamp dict (T,)
-        timestamp_dict = np.array([item['time'] for item in self.img_odom_buffer])
-        
-        ## get obs
-        obs_dict = dict()
-        obs_dict['image'] = img_dict
-        obs_dict['state'] = state_dict
-        obs_dict['goal'] = goal_dict
-        # obs_dict['timestamp'] = timestamp_dict
+            ## cal relative goal
+            if self.isGoal:
+                goal_dict = np.stack([self.get_relative_goal(item['pose'], item['euler'], self.goal) for item in self.img_odom_buffer], axis=0)
 
-        # print(f"Image shape: {img_dict.shape}")
-        # print(f"State shape: {state_dict.shape}")
-        # print(f"Goal shape: {goal_dict.shape}")
-        # print(f"Timestamp shape: {timestamp_dict.shape}")
-        # print("Obs dict: ", obs_dict)
+            else:
+                goal_dict = np.zeros((len(self.img_odom_buffer), 3), dtype=np.float32)
+                    
+            ## Make timestamp dict (T,)
+            timestamp_dict = np.array([item['time'] for item in self.img_odom_buffer])
+            
+            ## get obs
+            obs_dict = dict()
+            obs_dict['image'] = img_dict
+            obs_dict['state'] = state_dict
+            obs_dict['goal'] = goal_dict
+            # obs_dict['timestamp'] = timestamp_dict
+
+            # print(f"Image shape: {img_dict.shape}")
+            # print(f"State shape: {state_dict.shape}")
+            # print(f"Goal shape: {goal_dict.shape}")
+            # print(f"Timestamp shape: {timestamp_dict.shape}")
+            # print("Obs dict: ", obs_dict)
         return obs_dict
 
     def get_relative_goal(self, pose, euler, goal):
@@ -208,7 +214,7 @@ class InferenceNode:
                 rate.sleep()
                 continue
             # if self.isGoal:
-            if len(self.img_odom_buffer) == self.policy.n_obs_steps:
+            if self.isGoal and len(self.img_odom_buffer) == self.policy.n_obs_steps:
                 s = time.time()
                 obs_dict = self.get_obs()
                 
@@ -223,8 +229,9 @@ class InferenceNode:
                 obs_dict = self.dict_apply(obs_dict, lambda x: torch.from_numpy(x).unsqueeze(0).to('cuda'))
                 result = self.policy.predict_action(obs_dict)
                 action = result['action'][0].detach().to('cpu').numpy()
-                print(result)
+                # print(result)
                 # print(action)
+                print('Goal:', self.goal)
                 print('Inference latency[s]:', time.time() - s)
 
                 action_1_step = action[0]
