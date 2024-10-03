@@ -14,10 +14,11 @@ import cv2
 import numpy as np
 from sensor_msgs.msg import Image
 from nav_msgs.msg import Odometry, Path
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, Twist
 from cv_bridge import CvBridge, CvBridgeError
 from scipy import spatial
 from collections import deque
+from typing import Dict, Callable
 from message_filters import ApproximateTimeSynchronizer, Subscriber
 import tf
 import signal
@@ -25,6 +26,7 @@ import sys
 import dill
 import hydra
 import time
+from math import pi as M_PI
 from diffusion_policy.workspace.base_workspace import BaseWorkspace
 from diffusion_policy.policy.base_image_policy import BaseImagePolicy
 
@@ -58,16 +60,20 @@ class InferenceNode:
         self.state_obs = None
 
         # Subscribers for sync
-        self.img_sub = Subscriber(self, Image, '/camera/left/rgb_img')
-        self.odom_sub = Subscriber(self, Odometry, '/ground_truth_pose')
+        self.img_sub = Subscriber('/camera/left/rgb_img', Image)
+        self.odom_sub = Subscriber('/ground_truth_pose', Odometry)
 
         # ApproximateTimeSynchronizer
         self.ats = ApproximateTimeSynchronizer([self.img_sub, self.odom_sub], queue_size=10, slop=0.1)
         self.ats.registerCallback(self.sync_callback)
 
         # Subscriber for goal point
-        self.goal_sub = rospy.Subscriber('/goal_point', PoseStamped, self.goalpoint_callback)
+        self.goal_sub = rospy.Subscriber('/move_base_simple/goal', PoseStamped, self.goalpoint_callback) 
         self.isGoal = False
+
+        # Publisher for action
+        self.action_pub = rospy.Publisher('/cmd_vel', Twist, queue_size=10)
+        self.action_path_debug = rospy.Publisher('/action_path', Path, queue_size=10)
         
         # Main loop
         self.run_inference()
@@ -92,6 +98,7 @@ class InferenceNode:
         return policy
     
     def sync_callback(self, img_msg, odom_msg):
+        # print('asdfasd')
         synced_time = img_msg.header.stamp.to_sec()
         ## Img
         try:
@@ -100,7 +107,7 @@ class InferenceNode:
             # Convert to the required format
             cv_image = cv2.resize(cv_image, (640, 480)).astype(np.float32) / 255.0    # (H, W, C)
             cv_image = np.moveaxis(cv_image, -1, 0)  # Move channel to first dimension (C, H, W)
-            if self.debug: print(f"Image shape: {cv_image.shape}")
+            # if self.debug: print(f"Image shape: {cv_image.shape}")
         except CvBridgeError as e:
             rospy.logerr(f"Failed to convert image: {e}")
 
@@ -121,9 +128,11 @@ class InferenceNode:
             'time': synced_time # (1,)
         })
 
+        # if self.debug: print(f"buffer length: {len(self.img_odom_buffer)}")
+
     def goalpoint_callback(self, msg):
         if self.img_odom_buffer is None:
-            print("Waiting for state and image data...")
+            print("Goal: Waiting for state and image data...")
             return
         self.goal = np.array([msg.pose.position.x, msg.pose.position.y, msg.pose.position.z], dtype=np.float32)
         self.isGoal = True
@@ -151,7 +160,13 @@ class InferenceNode:
         obs_dict['image'] = img_dict
         obs_dict['state'] = state_dict
         obs_dict['goal'] = goal_dict
-        obs_dict['timestamp'] = timestamp_dict
+        # obs_dict['timestamp'] = timestamp_dict
+
+        # print(f"Image shape: {img_dict.shape}")
+        # print(f"State shape: {state_dict.shape}")
+        # print(f"Goal shape: {goal_dict.shape}")
+        # print(f"Timestamp shape: {timestamp_dict.shape}")
+        # print("Obs dict: ", obs_dict)
         return obs_dict
 
     def get_relative_goal(self, pose, euler, goal):
@@ -159,7 +174,7 @@ class InferenceNode:
         relative_goal = np.dot(R_curr.T, goal - pose)
         return relative_goal
 
-    def dict_apply(
+    def dict_apply(self,
         x: Dict[str, torch.Tensor], 
         func: Callable[[torch.Tensor], torch.Tensor]
         ) -> Dict[str, torch.Tensor]:
@@ -170,16 +185,33 @@ class InferenceNode:
             else:
                 result[key] = func(value)
         return result
+    
+    def cal_future_positions(self,initial_pose, linear_velocity, angular_velocity, dt=0.05, steps=30):
+        positions = [initial_pose]
+        current_pose = initial_pose
+
+        for _ in range(steps):
+            x, y, theta = current_pose
+            theta += angular_velocity * dt
+            x += linear_velocity * np.cos(theta) * dt
+            y += linear_velocity * np.sin(theta) * dt
+            current_pose = (x, y, theta)
+            positions.append(current_pose)
+
+        return positions
           
     def run_inference(self):
         rate = rospy.Rate(10)
         while not rospy.is_shutdown():
             if len(self.img_odom_buffer) == 0:
-                print("Waiting for state and image data...")
+                print("Run: Waiting for state and image data...")
                 rate.sleep()
                 continue
-            if self.isGoal:
+            # if self.isGoal:
+            if len(self.img_odom_buffer) == self.policy.n_obs_steps:
+                s = time.time()
                 obs_dict = self.get_obs()
+                
                 # self.img_odom_buffer.clear()
                 if obs_dict is None:
                     rate.sleep()
@@ -188,14 +220,47 @@ class InferenceNode:
                 # obs_dict['state'] = torch.from_numpy(obs_dict['state']).float().to('cuda')
                 # obs_dict['goal'] = torch.from_numpy(obs_dict['goal']).float().to('cuda')
                 # obs_dict['timestamp'] = torch.from_numpy(obs_dict['timestamp']).float().to('cuda')
-                obs_dict = dict_apply(obs_dict, lambda x: torch.from_numpy(x).unsqueeze(0).to('cuda'))
+                obs_dict = self.dict_apply(obs_dict, lambda x: torch.from_numpy(x).unsqueeze(0).to('cuda'))
                 result = self.policy.predict_action(obs_dict)
-                print(action)
+                action = result['action'][0].detach().to('cpu').numpy()
+                print(result)
+                # print(action)
+                print('Inference latency[s]:', time.time() - s)
+
+                action_1_step = action[0]
+
+                action_1_step[0] = np.clip(action_1_step[0], -1.0, 1.0).item()
+                action_1_step[1] = np.clip(action_1_step[1], -0.5, 0.5).item()
+                action_1_step[2] = np.clip(action_1_step[2], -90.0 * M_PI / 180.0, 90.0 * M_PI / 180.0).item()
+
+                # is action float?
+
+
+                action_msg = Twist()
+                action_msg.linear.x = action_1_step[0]
+                action_msg.linear.y = action_1_step[1]
+                action_msg.angular.z = action_1_step[2]
+                self.action_pub.publish(action_msg)
+
+                # Publish action path for debug
+                future_positions = self.cal_future_positions((0.0, 0.0, 0.0), action_1_step[0], action_1_step[2])
+
+                action_path_msg = Path()
+                action_path_msg.header.stamp = rospy.Time.now()
+                action_path_msg.header.frame_id = 'map'
+                
+                for pose in future_positions:
+                    pose_msg = PoseStamped()
+                    pose_msg.pose.position.x = pose[0]
+                    pose_msg.pose.position.y = pose[1]
+                    action_path_msg.poses.append(pose_msg)
+                self.action_path_debug.publish(action_path_msg)
+
             rate.sleep()
 
 
 if __name__ == '__main__':
-    model_path = 'path/to/your/model.pth'
+    model_path = '/home/dklee98/git/diffusion_ws/diffusion_policy/data/outputs/2024.09.11/11.57.17_train_diffusion_unet_hybrid_velocity_local_planner/checkpoints/latest.ckpt'
     try:
         node = InferenceNode(model_path)
     except rospy.ROSInterruptException:
